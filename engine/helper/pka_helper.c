@@ -5,6 +5,7 @@
 #include <string.h>
 #include <openssl/async.h>
 #include <openssl/crypto.h>
+ #include <sys/eventfd.h>
 
 #include "pka_helper.h"
 
@@ -132,13 +133,14 @@ ecc_mont_curve_t curve448;
 
 // The actual engine that provides PKA support. For now, a single process
 // is allowed.
-static pka_engine_info_t gbl_engine;
+static pka_engine_info_t gbl_engine = {0};
 
 // When running over multiple threads, a handle must be assigned per thread.
-static __thread pka_handle_t tls_handle;
+static __thread pka_handle_t tls_handle = 0;
 
-static uint32_t gbl_engine_init;
-static uint32_t gbl_engine_finish;
+
+static uint32_t gbl_engine_init = 0;
+static uint32_t gbl_engine_finish = 0;
 
 #define DEBUG_MODE    0x1
 #define PKA_D_ERROR   0x1
@@ -703,6 +705,7 @@ struct poll_args {
     int            fd;
     pka_operand_t *operand;
     ecc_point_t  **ecc_point;
+    bool            job_done;
 };
 
 
@@ -721,19 +724,32 @@ void init_operand(pka_operand_t *operand,
 
 
 typedef enum { PKA_SYNC, PKA_ASYNC, PKA_ASYNC_ERROR_PIPE, PKA_ASYNC_ERROR_MEM,
-               PKA_ASYNC_ERROR_OPERAND, PKA_ASYNC_ERROR_ARGS } pka_mode_t;
+               PKA_ASYNC_ERROR_OPERAND, PKA_ASYNC_ERROR_ARGS, PKA_ASYNC_ERROR_FDS  } pka_mode_t;
 
 typedef enum { PKA_ALGO_MOD, PKA_ALGO_ECC } pka_algo_t;
 
 
+
+ void cleanup(ASYNC_WAIT_CTX *ctx, const void *key, OSSL_ASYNC_FD r, void *args)
+ {
+
+    struct poll_args *p_args = (struct poll_args *) args;
+
+    close(p_args->fd);
+    OPENSSL_free(p_args);
+    return;
+ }
+
+
 pka_mode_t init_pka_async_job(pka_handle_t handle,     pka_algo_t    algo,
                               pka_operand_t **operand, ecc_point_t **ecc_point)
-{
+{         
     ASYNC_JOB *job = ASYNC_get_current_job();
 
     if (job)
     {
-        int               pipefds[2] = {0, 0}, fd = 0;
+       // int               pipefds[2] = {0, 0}, fd = 0;
+        OSSL_ASYNC_FD *fds;
         struct poll_args *p_args = NULL;
         size_t    numfds = 0;
 
@@ -760,29 +776,50 @@ pka_mode_t init_pka_async_job(pka_handle_t handle,     pka_algo_t    algo,
         if (p_args == NULL)
         {
             printf("%s Failed to malloc p_args\n", __FUNCTION__);
-	    free(operand);
+	        free(operand);
             return PKA_ASYNC_ERROR_ARGS;
         }
 
-        if (pipe(pipefds) != 0)
-        {
-            printf("%s Failed to create pipe\n", __FUNCTION__);
-            if (PKA_ALGO_MOD == algo)
-                free(operand);
+        // if (pipe(pipefds) != 0)
+        // {
+        //     printf("%s Failed to create pipe\n", __FUNCTION__);
+        //     if (PKA_ALGO_MOD == algo)
+        //         free(operand);
 
+        //     OPENSSL_free(p_args);
+        //     return PKA_ASYNC_ERROR_PIPE;
+        // }
+
+        p_args->fd = eventfd(0, EFD_NONBLOCK);
+        if (p_args->fd == -1) {
+            fprintf(stderr,"Failed to get eventfd = %d\n", errno);
             free(p_args);
             return PKA_ASYNC_ERROR_PIPE;
         }
 
-        if (!ASYNC_WAIT_CTX_get_all_fds(ctx, &fd, &numfds)
-                 || numfds >= 1)
-        {
-            ASYNC_WAIT_CTX_clear_fd(ctx, (void*) handle);
-            close(fd);
-            close(fd+1);
+        if (!ASYNC_WAIT_CTX_get_all_fds(ctx, NULL, &numfds)){
+            printf("%s ASYNC_WAIT_CTX_get_all_fds returned error\n", __FUNCTION__);
+            if (PKA_ALGO_MOD == algo)
+                free(operand);
+
+            close(p_args->fd);
+            OPENSSL_free(p_args);
+            perror("closing fd and returning error!!\n");      
+            return PKA_ASYNC_ERROR_FDS;
         }
 
-        p_args->fd = pipefds[0];
+        if (numfds >= 1)
+        {
+            fds = OPENSSL_malloc(numfds * sizeof(OSSL_ASYNC_FD));
+            if (fds == NULL) {
+                printf("Failed to malloc\n");
+                return 0;
+            }
+            ASYNC_WAIT_CTX_get_all_fds(ctx, fds, &numfds);
+            for (int i; i<numfds; i++)
+                close(fds[i]);
+            ASYNC_WAIT_CTX_clear_fd(ctx, (void*) handle);
+        }
 
         switch (algo)
         {
@@ -798,9 +835,13 @@ pka_mode_t init_pka_async_job(pka_handle_t handle,     pka_algo_t    algo,
         }
 
         p_args->job = job;
+        p_args->job_done = false;
 
-        ASYNC_WAIT_CTX_set_wait_fd(ASYNC_get_wait_ctx(job), (void*) handle,
-                                   pipefds[0], p_args, NULL);
+        if (ASYNC_WAIT_CTX_set_wait_fd(ASYNC_get_wait_ctx(job), (void*) handle,
+                                   p_args->fd, p_args, cleanup) == 0) {
+            perror("failed to set the fd in the ASYNC_WAIT_CTX\n");
+        }
+
         return PKA_ASYNC;
     }
     return PKA_SYNC;
@@ -855,6 +896,7 @@ static pka_operand_t *pka_do_mod_exp(pka_handle_t   handle,
     return (PKA_SYNC == mode)? results_to_operand(handle) : operand;
 }
 
+
 static pka_operand_t *pka_do_mod_exp_crt(pka_handle_t   handle,
                                          pka_operand_t *value,
                                          pka_operand_t *p,
@@ -869,7 +911,10 @@ static pka_operand_t *pka_do_mod_exp_crt(pka_handle_t   handle,
 
     switch (mode) {
         case PKA_ASYNC:
+    //    perror("PKA_ASYNC");
+        break;
         case PKA_SYNC:
+    //    perror("PKA_SYNC");
             break;
         default:
             DEBUG(PKA_D_ERROR, "pka_do_mod_exp_crt failed to setup async job %d\n", mode);
@@ -1048,8 +1093,8 @@ static int pka_engine_get_handle(pka_engine_info_t *engine)
 
     return_if_instance_invalid(engine->instance);
 
-    if (handle_is_valid(*handle))
-        return 1;
+    // if (handle_is_valid(*handle))
+    //     return 1;
 
     reset_pka_handle(*handle);
 
@@ -1284,6 +1329,7 @@ int pka_rsa_mod_exp_crt(pka_bignum_t  *bn_value,
 {
     pka_operand_t     *value, *p, *q, *d_q, *d_p, *qinv, *result;
     int                rc;
+
 
     PKA_ASSERT(bn_value  != NULL);
     PKA_ASSERT(bn_p      != NULL);
@@ -1596,23 +1642,27 @@ int pka_init(void)
 {
     int ret;
 
-    if (__sync_bool_compare_and_swap(&gbl_engine_init, 1, 1))
-        return 1; // Engine already exist.
+  //  if (__sync_bool_compare_and_swap(&gbl_engine_init, 1, 1))
+        pka_finish();
+        // return 1; // Engine already exist.
 
     ret = pka_init_engine();
     if (ret != 0)
         __sync_fetch_and_add(&gbl_engine_init, 1);
+    else{
+        perror("error in pka_init\n");
+    }
 
     return ret;
 }
 
 int pka_finish(void)
 {
-    if (__sync_bool_compare_and_swap(&gbl_engine_finish, 0, 0))
-    {
+    // if (__sync_bool_compare_and_swap(&gbl_engine_finish, 0, 0))
+    // {
         pka_release_engine();
         __sync_fetch_and_add(&gbl_engine_finish, 1);
-    }
+    // }
 
     return 1;
 }

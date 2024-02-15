@@ -28,6 +28,7 @@
 uint64_t cpu_f_hz;
 
 pthread_t polling_tid = 0;
+pka_local_info_t  *g_local_info = NULL;
 
 struct thread_args {
     pka_local_info_t  *local_info;
@@ -38,6 +39,7 @@ struct poll_args {
     int             fd;
     pka_operand_t  *operand;
     ecc_point_t   **ecc_point;
+    bool            job_done;
 };
 
 // Start statistics counters. Returns the command number associated with
@@ -348,6 +350,7 @@ pka_handle_t pka_init_local(pka_instance_t instance)
     PKA_DEBUG(PKA_USER, "PKA handle %d initialized successfully\n",
                     worker_id);
 
+    g_local_info = local_info;
     return (pka_handle_t) local_info;
 }
 
@@ -808,6 +811,97 @@ static ecc_point_t *malloc_ecc_point(uint32_t x_buf_len,
 }
 
 
+int enable_external_polling  = 0;
+
+void pka_enable_external_polling (){
+
+    enable_external_polling  = 1;
+    return;
+}
+
+
+
+
+void nginx_poll_func()
+{
+    pka_lock_t         lock;
+    int errors = 0, count = 0;
+
+    
+    if (!g_local_info){
+         perror("poll_func: g_local_info is NULL!!\n ");
+         return;
+    }
+
+    do {
+        lock = pka_try_acquire_lock(&g_local_info->gbl_info->lock.v,
+                                    g_local_info->id, false);
+        if (lock != LOCK_ACQUIRED)
+        {
+                PKA_DEBUG(PKA_USER, "lock failed, retry\n");
+        }
+    }
+    while (lock != LOCK_ACQUIRED);
+       
+    pka_rslt_dequeue(g_local_info, &errors, &count);
+
+    for (int i =0; i < count; ++i)
+    {
+        pka_results_t results;
+        uint8_t       res1[MAX_BYTE_LEN];
+        uint8_t       res2[MAX_BYTE_LEN];
+        memset(&results, 0, sizeof(pka_results_t));
+        init_results_operand(&results, 2, res1, MAX_BYTE_LEN, res2, MAX_BYTE_LEN);
+
+        pka_get_result((pka_handle_t) g_local_info, &results);
+        if (results.status == RC_NO_ERROR)
+        {
+            struct poll_args *p_args;
+
+            if (results.user_data)
+            {
+                p_args = (struct poll_args *) results.user_data;
+
+                if (p_args->operand)
+                {
+                    p_args->operand->buf_ptr = calloc(1,results.results[0].actual_len);
+                    p_args->operand->buf_len = results.results[0].actual_len;
+                    p_args->operand->actual_len = 0;
+                    copy_operand(&results.results[0], p_args->operand);
+                } 
+                else if (p_args->ecc_point != NULL)
+                {
+                    uint32_t x_len = results.results[0].actual_len;
+                    uint32_t y_len = results.results[1].actual_len;
+                    *p_args->ecc_point = malloc_ecc_point(x_len, y_len);
+                    copy_operand(&results.results[0], &(*p_args->ecc_point)->x);
+                    copy_operand(&results.results[1], &(*p_args->ecc_point)->y);
+                }
+
+                p_args -> job_done = true;
+                uint64_t buf = 1;
+                if ( write(p_args->fd, &buf, sizeof(uint64_t)) == -1)
+                {
+                    fprintf(stderr," polling write error on discriptor %d\n", p_args->fd);                       
+                }
+            }
+            
+        }
+        else 
+        {
+            fprintf(stderr, " PKA responses error %d\n", results.status);
+        }
+
+    }
+
+    do {
+        lock = pka_try_release_lock(&g_local_info->gbl_info->lock.v, g_local_info->id);
+    }
+    while (lock != LOCK_RELEASED);
+
+    return;
+}
+
 static unsigned int g_pka_responses = 0;
 
 void* polling_func(void* args)
@@ -851,7 +945,6 @@ void* polling_func(void* args)
 
 	       if (results.user_data)
 	       {
-		   static char c = 'X';
                    p_args = (struct poll_args *) results.user_data;
                    ++g_pka_responses;
 
@@ -871,12 +964,12 @@ void* polling_func(void* args)
                        copy_operand(&results.results[1], &(*p_args->ecc_point)->y);
                    }
                    ++total_rslts;
-                   if ( -1 == write(p_args->fd + 1, &c, 1))
-		   {
-		       perror(" polling write ");
-                       // write failure
-		   }
-		   free(p_args);
+                   p_args -> job_done = true;
+                    uint64_t buf = 1;
+                    if ( write(p_args->fd, &buf, sizeof(uint64_t)) == -1)
+                    {
+                        fprintf(stderr," polling write on discriptor %d\n", p_args->fd);      
+                    }
 	       }
 	   }
 	   else 
@@ -919,6 +1012,7 @@ static pka_status_t pka_submit_cmd(pka_handle_t    handle,
     uint32_t              cmd_num;
 
     int rc = 0, errors = 0, count = 0;
+    struct poll_args *p_args = NULL;
     ASYNC_JOB *job = ASYNC_get_current_job();
 
     // Get context information.
@@ -949,11 +1043,11 @@ static pka_status_t pka_submit_cmd(pka_handle_t    handle,
     } 
     else
     {
-	ASYNC_WAIT_CTX *ctx = ASYNC_get_wait_ctx(job);
-	int   fd = 0;
-	void *p_args = NULL;
+        ASYNC_WAIT_CTX *ctx = ASYNC_get_wait_ctx(job);
+        int   fd = 0;
 
-        if (0 == polling_tid)
+  
+        if (0 == polling_tid && enable_external_polling == 0)
         {
             struct thread_args *t_args = malloc(sizeof (struct thread_args));
             t_args->local_info = local_info;
@@ -961,11 +1055,11 @@ static pka_status_t pka_submit_cmd(pka_handle_t    handle,
             pthread_create(&polling_tid, NULL, &polling_func, (void*)t_args);
         }
 
-	if (NULL != ctx)
-	{
-            ASYNC_WAIT_CTX_get_fd(ctx, handle, &fd, &p_args);
-            cmd_desc.user_data = (uint64_t) p_args;
-	}
+        if (NULL != ctx)
+        {
+                ASYNC_WAIT_CTX_get_fd(ctx, handle, &fd, &p_args);
+                cmd_desc.user_data = (uint64_t) p_args;
+        }
     }
     //
     // Start processing PK command.
@@ -1005,8 +1099,15 @@ static pka_status_t pka_submit_cmd(pka_handle_t    handle,
 	// With openSSL async_jobs, The job will be context swtiched out of
 	// execution. Once it received a signal - by file descriptor of pipe.
 	// The context will became active and continue the execuation.
-        if (job)
-            ASYNC_pause_job();
+        int job_ret = 0;
+        if (job){
+            do {
+                if ((job_ret = ASYNC_pause_job()) == 0){
+                        perror("ERROR pausing job!\n");    
+                }
+            }
+            while (job_ret == 0 || job_ret == -1  || p_args->job_done == false);
+        }
 
         local_info->req_num++;
         return SUCCESS;
@@ -1059,9 +1160,22 @@ static pka_status_t pka_submit_cmd(pka_handle_t    handle,
             }
         }
 
-        pka_process_queues_sync(local_info);
-        if (job)
-            ASYNC_pause_job();
+    //    pka_process_queues_sync(local_info);
+        while (true)
+        {
+            lock = pka_try_release_lock(&gbl_info->lock.v, local_info->id);
+            if (lock == LOCK_RELEASED)
+                break; // lock was released.
+        }
+        int job_ret = 0;
+        if (job){
+            do {
+                if ((job_ret = ASYNC_pause_job()) == 0){
+                        perror("ERROR pausing job!\n");    
+                }
+            }
+            while (job_ret == 0 || job_ret == -1  || p_args->job_done == false);
+        }
 
         local_info->req_num++;
         return SUCCESS;

@@ -31,6 +31,9 @@ extern "C" {
 
 #define PKA_BITS    (PKA_BYTES * 8)
 
+# define PKA_CMD_POLL ENGINE_CMD_BASE
+# define PKA_CMD_ENABLE_EXTERNAL_POLLING (ENGINE_CMD_BASE + 1)
+
 
 #define PKA_ENGINE_QUEUE_CNT         8
 #define PKA_ENGINE_RING_CNT          4

@@ -29,6 +29,14 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 
+#define NO_DSA
+#define NO_DH
+#define NO_EC
+#define NO_ECDH
+#define NO_ECDSA
+#define NO_RAND
+
+
 #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
 #include "ec_local.h"
 #endif
@@ -65,6 +73,9 @@ static int engine_pka_bn_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
 #ifndef NO_RSA
 static int engine_pka_rsa_mod_exp(BIGNUM *r0, const BIGNUM *I, RSA *rsa,
                                     BN_CTX *ctx);
+
+static int engine_pka_rsa_private_decrypt(int flen, const unsigned char *from,
+                                   unsigned char *to, RSA *rsa, int padding);
 #endif
 
 /* DH stuff */
@@ -312,6 +323,73 @@ static DH_METHOD pka_dh_meth = {
 /* rand stuff */
 # endif
 
+
+
+
+const ENGINE_CMD_DEFN pka_cmd_defns[] = {
+
+    {
+        PKA_CMD_POLL,
+        "POLL",
+        "Polls the engine for any completed requests",
+        ENGINE_CMD_FLAG_NO_INPUT},
+
+    {
+        PKA_CMD_ENABLE_EXTERNAL_POLLING,
+        "ENABLE_EXTERNAL_POLLING",
+        "Sets external polling which disables the polling threads by LibPKA",
+        ENGINE_CMD_FLAG_NO_INPUT},
+
+    {0, NULL, NULL, 0}
+};
+
+
+int pka_engine_ctrl(ENGINE *e, int cmd, long i, void *p, void (*f) (void))
+{
+
+    unsigned int retVal = 1;
+
+    switch (cmd) {
+
+        case PKA_CMD_POLL:
+            // Nginx sends this command very frequently, depending on poll interval specified in nginx.conf file - i.e., 1ms in current case.
+            nginx_poll_func();
+            break;
+
+        case PKA_CMD_ENABLE_EXTERNAL_POLLING:
+            pka_enable_external_polling ();
+            break;
+
+        default:
+            fprintf(stderr,"Warning: CTRL command not implemented. \n");
+            retVal = 0;
+            break;
+    }
+
+    return retVal;
+}
+
+
+void ngx_worker_pka_init_after_fork_processing_handler(void)
+{
+
+    /* Reinitialise the engine */
+    ENGINE* e = ENGINE_by_id(engine_pka_id);
+
+    if (NULL == e) {
+        printf("Warning: Engine pointer is NULL \n");
+        return;
+    }
+
+    if (!engine_pka_init(e)) {
+        perror("Failure in engine_pka_start_init function for Nginx worker\n");
+    }
+
+    ENGINE_free(e);
+    return;
+}
+
+
 static int bind_pka(ENGINE *e)
 {
     int rc = 1;
@@ -336,7 +414,8 @@ static int bind_pka(ENGINE *e)
     rc   &= RSA_meth_set_pub_enc(pka_rsa_meth, RSA_meth_get_pub_enc(meth));
     rc   &= RSA_meth_set_pub_dec(pka_rsa_meth, RSA_meth_get_pub_dec(meth));
     rc   &= RSA_meth_set_priv_enc(pka_rsa_meth, RSA_meth_get_priv_enc(meth));
-    rc   &= RSA_meth_set_priv_dec(pka_rsa_meth, RSA_meth_get_priv_dec(meth));
+   // rc   &= RSA_meth_set_priv_dec(pka_rsa_meth, RSA_meth_get_priv_dec(meth));
+    rc   &= RSA_meth_set_priv_dec(pka_rsa_meth, engine_pka_rsa_private_decrypt);
     if (!rc)
     {
         printf("ERROR: failed to hook PKCS1_SSLeay() functions\n");
@@ -538,13 +617,15 @@ static int bind_pka(ENGINE *e)
 # endif
         || rc != ENGINE_set_destroy_function(e, engine_pka_destroy)
         || rc != ENGINE_set_init_function(e, engine_pka_init)
-        || rc != ENGINE_set_finish_function(e, engine_pka_finish))
+        || rc != ENGINE_set_finish_function(e, engine_pka_finish)
+        || rc != ENGINE_set_ctrl_function(e, pka_engine_ctrl)
+        || rc != ENGINE_set_cmd_defns(e, pka_cmd_defns))
     {
         printf("ERROR: failed to setup ENGINE [%s] %s\n",
                engine_pka_id, engine_pka_name);
         return 0;
     }
-
+    pthread_atfork(NULL, NULL, ngx_worker_pka_init_after_fork_processing_handler);
     return 1;
 }
 
@@ -638,6 +719,7 @@ engine_pka_bn_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
     int     rc, result_bit_len;
 
     rc = 0;
+
 
     result         = BN_new();
     result_bit_len = BN_num_bits(m);
@@ -733,8 +815,169 @@ end:
 }
 #endif
 
+
+
 #ifndef NO_RSA
 /* RSA implementation */
+
+static int engine_pka_rsa_private_decrypt(int flen, const unsigned char *from,
+                                   unsigned char *to, RSA *rsa, int padding)
+{
+    BIGNUM *f, *ret;
+    int j, num = 0, r = -1;
+    unsigned char *buf = NULL;
+    unsigned char kdk[SHA256_DIGEST_LENGTH] = {0};
+    BN_CTX *ctx = NULL;
+    int local_blinding = 0;
+    /*
+     * Used only if the blinding structure is shared. A non-NULL unblind
+     * instructs rsa_blinding_convert() and rsa_blinding_invert() to store
+     * the unblinding factor outside the blinding structure.
+     */
+    BIGNUM *unblind = NULL;
+    BN_BLINDING *blinding = NULL;
+
+    /*
+     * we need the value of the private exponent to perform implicit rejection
+     */
+    // if ((rsa->flags & RSA_FLAG_EXT_PKEY) && (padding == RSA_PKCS1_PADDING))
+    //     padding = RSA_PKCS1_NO_IMPLICIT_REJECT_PADDING;
+
+    if ((ctx = BN_CTX_new()) == NULL)
+        goto err;
+    BN_CTX_start(ctx);
+    f = BN_CTX_get(ctx);
+    ret = BN_CTX_get(ctx);
+    if (ret == NULL) {
+        ERR_raise(ERR_LIB_RSA, ERR_R_BN_LIB);
+        goto err;
+    }
+    num = RSA_size(rsa);
+    buf = OPENSSL_malloc(num);
+    if (buf == NULL)
+        goto err;
+
+    /*
+     * This check was for equality but PGP does evil things and chops off the
+     * top '0' bytes
+     */
+    if (flen > num) {
+     //   ERR_raise(ERR_LIB_RSA, RSA_R_DATA_GREATER_THAN_MOD_LEN);
+        perror("RSA_R_DATA_GREATER_THAN_MOD_LEN \n");
+        goto err;
+    }
+
+    if (flen < 1) {
+       // ERR_raise(ERR_LIB_RSA, RSA_R_DATA_TOO_SMALL);
+         perror("RSA_R_DATA_TOO_SMALL \n");
+        goto err;
+    }
+
+    /* make data into a big number */
+    if (BN_bin2bn(from, (int)flen, f) == NULL)
+        goto err;
+
+    // if (BN_ucmp(f, rsa->n) >= 0) {
+    //  //   ERR_raise(ERR_LIB_RSA, RSA_R_DATA_TOO_LARGE_FOR_MODULUS);
+    //      perror("RSA_R_DATA_TOO_LARGE_FOR_MODULUS \n");
+    //     goto err;
+    // }
+
+    // if (rsa->flags & RSA_FLAG_CACHE_PUBLIC)
+    //     if (!BN_MONT_CTX_set_locked(&rsa->_method_mod_n, rsa->lock,
+    //                                 rsa->n, ctx))
+    //         goto err;
+
+    // if (!(rsa->flags & RSA_FLAG_NO_BLINDING)) {
+    //     blinding = rsa_get_blinding(rsa, &local_blinding, ctx);
+    //     if (blinding == NULL) {
+    //         ERR_raise(ERR_LIB_RSA, ERR_R_INTERNAL_ERROR);
+    //         goto err;
+    //     }
+    // }
+
+    // if (blinding != NULL) {
+    //     if (!local_blinding && ((unblind = BN_CTX_get(ctx)) == NULL)) {
+    //         ERR_raise(ERR_LIB_RSA, ERR_R_BN_LIB);
+    //         goto err;
+    //     }
+    //     if (!rsa_blinding_convert(blinding, f, unblind, ctx))
+    //         goto err;
+    // }
+
+    /* do the decrypt */
+    // if ((rsa->flags & RSA_FLAG_EXT_PKEY) ||
+    //     (rsa->version == RSA_ASN1_VERSION_MULTI) ||
+    //     ((rsa->p != NULL) &&
+    //      (rsa->q != NULL) &&
+    //      (rsa->dmp1 != NULL) && (rsa->dmq1 != NULL) && (rsa->iqmp != NULL))) {
+        if (!engine_pka_rsa_mod_exp(ret, f, rsa, ctx))
+            goto err;
+
+    // } else {
+    //     BIGNUM *d = BN_new();
+    //     if (d == NULL) {
+    //         ERR_raise(ERR_LIB_RSA, ERR_R_BN_LIB);
+    //         goto err;
+    //     }
+    //     if (rsa->d == NULL) {
+    //         ERR_raise(ERR_LIB_RSA, RSA_R_MISSING_PRIVATE_KEY);
+    //         BN_free(d);
+    //         goto err;
+    //     }
+    //     BN_with_flags(d, rsa->d, BN_FLG_CONSTTIME);
+    //     if (!rsa->meth->bn_mod_exp(ret, f, d, rsa->n, ctx,
+    //                                rsa->_method_mod_n)) {
+    //         BN_free(d);
+    //         goto err;
+    //     }
+    //     /* We MUST free d before any further use of rsa->d */
+    //     BN_free(d);
+    // }
+
+    // if (blinding)
+    //     if (!rsa_blinding_invert(blinding, ret, unblind, ctx))
+    //         goto err;
+
+    /*
+     * derive the Key Derivation Key from private exponent and public
+     * ciphertext
+     */
+    // if (padding == RSA_PKCS1_PADDING) {
+    //     if (derive_kdk(flen, from, rsa, buf, num, kdk) == 0)
+    //         goto err;
+    // }
+
+    j = BN_bn2binpad(ret, buf, num);
+    if (j < 0)
+        goto err;
+
+    switch (padding) {
+    // case RSA_PKCS1_NO_IMPLICIT_REJECT_PADDING:
+    //     r = RSA_padding_check_PKCS1_type_2(to, num, buf, j, num);
+    //     break;
+    // case RSA_PKCS1_PADDING:
+    //     r = ossl_rsa_padding_check_PKCS1_type_2(rsa->libctx, to, num, buf, j, num, kdk);
+    //     break;
+    case RSA_PKCS1_OAEP_PADDING:
+        r = RSA_padding_check_PKCS1_OAEP(to, num, buf, j, num, NULL, 0);
+        break;
+    case RSA_NO_PADDING:
+        memcpy(to, buf, (r = j));
+        break;
+    default:
+        ERR_raise(ERR_LIB_RSA, RSA_R_UNKNOWN_PADDING_TYPE);
+        goto err;
+    }
+
+
+ err:
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+    OPENSSL_clear_free(buf, num);
+    return r;
+}
+
 static int
 engine_pka_rsa_mod_exp(BIGNUM *r0, const BIGNUM *I, RSA *rsa, BN_CTX *ctx)
 {
