@@ -1,0 +1,61 @@
+Preq:
+
+sudo apt install autoconf
+sudo apt-get install libtool
+
+
+
+=======================
+
+OpenSSL:
+
+git clone https://github.com/openssl/openssl.git
+cd openssl
+./config --prefix=/usr/local/ssl --openssldir=/usr/local/ssl -Wl,-rpath=/usr/local/ssl/lib -g --no-doc
+
+make -j8
+make install
+
+=======================
+
+PKA library:
+  
+git clone git@github.com:railabouni/pka.git
+cd pka
+autoreconf -ifv
+./configure --disable-testutils --without-doxygen
+  
+make && cp ./engine/.libs/libbfengine.so /usr/local/ssl/lib/engines-3/pka.so && cp ./lib/.libs/libPKA.so.1.1.0 /usr/local/ssl/lib/engines-3/libPKA.so
+ 
+  
+=======================
+
+NGINX:
+
+git clone https://github.com/intel/asynch_mode_nginx.git
+
+cp -r pka/nginx/nginx_pka_module asynch_mode_nginx/modules/
+
+export NGINX_INSTALL_DIR=<Nginx Intallation directory> && export OPENSSL_LIB=/usr/local/ssl && ./configure --with-debug --prefix=$NGINX_INSTALL_DIR --with-http_ssl_module --with-http_v2_module --with-stream --with-stream_ssl_module --add-dynamic-module=modules/nginx_pka_module/ --with-cc-opt="-DNGX_HAVE_ASYNC=1 -DNGX_SECURE_MEM -I$OPENSSL_LIB/include" --with-ld-opt="-Wl,-rpath=$OPENSSL_LIB/lib -L$OPENSSL_LIB/lib -lz"
+
+make && make install
+
+=======================
+
+Setup server keys and Certs:
+
+mkdir $NGINX_INSTALL_DIR/key_cert/
+cd $NGINX_INSTALL_DIR/key_cert/
+
+openssl req -x509 -sha256 -nodes -days 365 -newkey rsa:2048 -keyout server.key -out server.crt #RSA Cert
+openssl ecparam -genkey -out key.pem -name prime256v1 #DSA Cert
+openssl req -x509 -new -key key.pem -out cert.pem #finalize DSA Cert 
+openssl dhparam -out dhparam.pem 2048
+ 
+=======================
+ 
+Configure Nginx:
+
+cp pka/nginx/nginx.conf <Nginx Intallation directory>/conf/
+
+There are line with "TODO" inside nginx.conf, please change them as requested
