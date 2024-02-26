@@ -64,10 +64,10 @@ There are line with "TODO" inside nginx.conf, please change them as requested
 
 Configure BF3:
 
-ethtool -L p0 combined 16
-ethtool -G p0 rx 8192 tx 8192
-ethtool -C p0 adaptive-rx off
-ethtool -C p0 adaptive-tx on
+ethtool -L <interface used on BF3, e.g., p0> combined 16
+ethtool -G <interface used on BF3, e.g., p0> rx 8192 tx 8192
+ethtool -C <interface used on BF3, e.g., p0> adaptive-rx off
+ethtool -C <interface used on BF3, e.g., p0> adaptive-tx on
 
 
 
