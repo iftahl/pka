@@ -59,3 +59,15 @@ Configure Nginx:
 cp pka/nginx/nginx.conf <Nginx Intallation directory>/conf/
 
 There are line with "TODO" inside nginx.conf, please change them as requested
+
+========================
+
+Configure BF3:
+
+ethtool -L p0 combined 16
+ethtool -G p0 rx 8192 tx 8192
+
+
+
+
+
