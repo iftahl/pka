@@ -66,7 +66,8 @@ Configure BF3:
 
 ethtool -L p0 combined 16
 ethtool -G p0 rx 8192 tx 8192
-
+ethtool -C p0 adaptive-rx off
+ethtool -C p0 adaptive-tx on
 
 
 
