@@ -67,7 +67,7 @@ Configure BF3:
 ethtool -L <interface used on BF3, e.g., p0> combined 16
 ethtool -G <interface used on BF3, e.g., p0> rx 1024 tx 1024
 ethtool -C <interface used on BF3, e.g., p0> adaptive-rx off
-ethtool -C <interface used on BF3, e.g., p0> adaptive-tx on
+ethtool -C <interface used on BF3, e.g., p0> adaptive-tx off
 
 
 
