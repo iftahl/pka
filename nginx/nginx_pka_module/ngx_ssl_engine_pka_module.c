@@ -302,6 +302,11 @@ static ngx_connection_t dumb;
 static ngx_int_t
 ngx_ssl_engine_pka_register_handler(ngx_cycle_t *cycle)
 {
+    //TODO: add a check for "ssl_asynch" in nginx.conf to stop here and return NGX_OK. polling handler is not needed when ssl_asynch==off.
+    //if (ssl_asynch==off)
+    //    return NGX_OK;
+
+
     //relying on PKA's polling thread
     if (pka_engine_external_poll_interval == 0){
         return NGX_OK;
