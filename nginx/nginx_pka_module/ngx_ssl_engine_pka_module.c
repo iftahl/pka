@@ -130,7 +130,7 @@ ngx_ssl_engine_pka_send_ctrl(ngx_cycle_t *cycle)
 
     // external interval zero means that we're relying on the LibPKA polling threads
     int poll_status = 0;
-    if (pka_engine_external_poll_interval > 0){
+    if (pka_engine_external_poll_interval != 0){
         if (!ENGINE_ctrl_cmd(e, "ENABLE_EXTERNAL_POLLING", 0, &poll_status, NULL, 0)) {
             ngx_log_error(NGX_LOG_EMERG, cycle->log, 0, "PKA Engine ENABLE_EXTERNAL_POLLING failed");
         }
@@ -220,7 +220,7 @@ ngx_ssl_engine_pka_init_conf(ngx_cycle_t *cycle, void *conf)
                             EXTERNAL_POLL_DEFAULT_INTERVAL);
     
     if (sedcf->external_poll_interval > 100
-        || sedcf->external_poll_interval < -1) {
+        || sedcf->external_poll_interval < 0) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
                       "invalid external poll interval");
         return NGX_CONF_ERROR;
@@ -304,7 +304,7 @@ ngx_ssl_engine_pka_register_handler(ngx_cycle_t *cycle)
 {
 
     //relying on PKA's internal polling thread if 0 or sync mode PKA if -1
-    if (pka_engine_external_poll_interval <= 0){
+    if (pka_engine_external_poll_interval == 0){
         return NGX_OK;
     }
     
