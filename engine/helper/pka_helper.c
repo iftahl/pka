@@ -728,14 +728,22 @@ typedef enum { PKA_SYNC, PKA_ASYNC, PKA_ASYNC_ERROR_PIPE, PKA_ASYNC_ERROR_MEM,
 
 typedef enum { PKA_ALGO_MOD, PKA_ALGO_ECC } pka_algo_t;
 
+struct fd_list {
+	int fd;
+	struct fd_list* next;
+};
 
+struct fd_list* head = NULL;
 
  void cleanup(ASYNC_WAIT_CTX *ctx, const void *key, OSSL_ASYNC_FD r, void *args)
  {
 
     struct poll_args *p_args = (struct poll_args *) args;
-
-    close(p_args->fd);
+    struct fd_list* node = (struct fd_list*)malloc(sizeof(struct fd_list));
+    node->next = head;
+    node->fd = p_args->fd;
+    head = node;
+//    close(p_args->fd);
     OPENSSL_free(p_args);
     return;
  }
@@ -790,7 +798,14 @@ pka_mode_t init_pka_async_job(pka_handle_t handle,     pka_algo_t    algo,
         //     return PKA_ASYNC_ERROR_PIPE;
         // }
 
-        p_args->fd = eventfd(0, EFD_NONBLOCK);
+	if (head) {
+		struct fd_list* node = head;
+		head = head->next;
+		p_args->fd = node->fd;
+		free(node);
+	} else {
+        	p_args->fd = eventfd(0, EFD_NONBLOCK);
+	}
         if (p_args->fd == -1) {
             fprintf(stderr,"Failed to get eventfd = %d\n", errno);
             free(p_args);
